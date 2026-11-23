@@ -1,0 +1,5 @@
+build/
+*.o
+course/mitm_mpi_2_block
+OAR.*
+__pycache__/
