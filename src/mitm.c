@@ -18,6 +18,11 @@
  * OpenMP, sends every pair to the rank that owns z, and the owner inserts
  * it. The search side does the same with g(y) and probes on arrival.
  *
+ * A pair travels as one 64-bit word instead of two. The owner already knows
+ * z mod p (it is its own rank) and which block every rank is working on, so
+ * the word only carries z / p, the position of the key in its block, and as
+ * many fingerprint bits as fit in the rest.
+ *
  * With --passes K the dictionary is split into K classes of z. Pass j keeps
  * only the pairs whose z falls in class j, so each rank holds 1/K of its
  * shard at a time. f and g are recomputed in every pass: memory drops by K,
@@ -92,28 +97,50 @@ typedef struct {
 	uint64_t start, end;   /* this rank's slice of the key space */
 	uint64_t rounds;       /* blocks per pass, identical on every rank */
 	uint64_t *w;           /* middle states of the current block */
-	uint64_t *send;        /* pairs grouped by destination */
+	uint64_t *send;        /* packed pairs grouped by destination */
+	int qbits, obits;      /* bits of z / p and of the offset in a block */
+	int fpbits;            /* fingerprint bits left in a word */
 	exchange_t ex;
 	dict_t dict;
 	double t_eval, t_comm, t_insert, t_probe;
 	uint64_t candidates;
+	uint64_t words_sent;   /* to other ranks and to itself */
 	int nres;
 	uint64_t res1[MAX_RESULTS], res2[MAX_RESULTS];
 } search_t;
 
-static inline int pass_of(uint64_t w, int passes)
+static inline int pass_of(uint64_t z, int passes)
 {
-	return passes == 1 ? 0 : (int)((mix64(w & mask) >> 40) % (uint64_t)passes);
+	return passes == 1 ? 0 : (int)((mix64(z) >> 40) % (uint64_t)passes);
 }
 
-static inline int owner(uint64_t w, int p)
+/* first key of rank r's slice */
+static inline uint64_t slice_start(int r, int p)
 {
-	return (int)((w & mask) % (uint64_t)p);
+	return (uint64_t)(((unsigned __int128)r << n) / (unsigned)p);
+}
+
+static inline uint64_t pack(const search_t *s, uint64_t w, uint64_t offset)
+{
+	uint64_t z = w & mask;
+	uint64_t fp = (w >> n) & ((1ull << s->fpbits) - 1);
+	return ((z / (uint64_t)s->p) << (s->obits + s->fpbits)) | (offset << s->fpbits) | fp;
+}
+
+/* inverse of pack, on the owner side; sender is the rank the word came from */
+static inline void unpack(const search_t *s, uint64_t word, int sender, uint64_t round,
+                          uint64_t *z, uint64_t *fp, uint64_t *key)
+{
+	uint64_t q = word >> (s->obits + s->fpbits);
+	uint64_t offset = (word >> s->fpbits) & ((1ull << s->obits) - 1);
+	*z = q * (uint64_t)s->p + (uint64_t)s->rank;
+	*fp = word & ((1ull << s->fpbits) - 1);
+	*key = slice_start(sender, s->p) + round * s->block + offset;
 }
 
 /*
  * Evaluate fun on block `round` of this rank's slice, keep the states whose
- * z is in class `pass`, and group the (state, key) pairs by owner rank.
+ * z is in class `pass`, and group the packed pairs by owner rank.
  */
 static void prepare_block(search_t *s, uint64_t (*fun)(uint64_t), uint64_t round, int pass)
 {
@@ -128,9 +155,11 @@ static void prepare_block(search_t *s, uint64_t (*fun)(uint64_t), uint64_t round
 
 	int p = s->p;
 	memset(s->ex.send_count, 0, p * sizeof(int));
-	for (uint64_t i = 0; i < count; i++)
-		if (pass_of(s->w[i], s->passes) == pass)
-			s->ex.send_count[owner(s->w[i], p)] += 2;
+	for (uint64_t i = 0; i < count; i++) {
+		uint64_t z = s->w[i] & mask;
+		if (pass_of(z, s->passes) == pass)
+			s->ex.send_count[z % p]++;
+	}
 
 	int offset = 0;
 	for (int r = 0; r < p; r++) {
@@ -141,14 +170,13 @@ static void prepare_block(search_t *s, uint64_t (*fun)(uint64_t), uint64_t round
 	int *fill = malloc(p * sizeof(int));
 	memcpy(fill, s->ex.send_displ, p * sizeof(int));
 	for (uint64_t i = 0; i < count; i++) {
-		uint64_t w = s->w[i];
-		if (pass_of(w, s->passes) != pass)
+		uint64_t w = s->w[i], z = w & mask;
+		if (pass_of(z, s->passes) != pass)
 			continue;
-		int r = owner(w, p);
-		s->send[fill[r]++] = w;
-		s->send[fill[r]++] = base + i;
+		s->send[fill[z % p]++] = pack(s, w, i);
 	}
 	free(fill);
+	s->words_sent += (uint64_t)offset;
 }
 
 static void build_shard(search_t *s, int pass)
@@ -161,15 +189,21 @@ static void build_shard(search_t *s, int pass)
 		double t1 = MPI_Wtime();
 		s->t_comm += t1 - t0;
 
-		if (dict_reserve(&s->dict, m / 2) < 0)
+		if (dict_reserve(&s->dict, m) < 0)
 			errx(1, "rank %d: dictionary full, use more ranks or more passes", s->rank);
-		const uint64_t *recv = s->ex.recv;
+		for (int r = 0; r < s->p; r++) {
+			const uint64_t *recv = s->ex.recv + s->ex.recv_displ[r];
+			int count = s->ex.recv_count[r];
 #pragma omp parallel for schedule(static)
-		for (size_t i = 0; i < m; i += 2) {
-			if (i + 2 * PREFETCH_AHEAD < m)
-				dict_prefetch_write(&s->dict, recv[i + 2 * PREFETCH_AHEAD] & mask);
-			uint64_t w = recv[i];
-			dict_insert_concurrent(&s->dict, w & mask, w >> n, recv[i + 1]);
+			for (int i = 0; i < count; i++) {
+				uint64_t z, fp, x;
+				if (i + PREFETCH_AHEAD < count) {
+					unpack(s, recv[i + PREFETCH_AHEAD], r, round, &z, &fp, &x);
+					dict_prefetch_write(&s->dict, z);
+				}
+				unpack(s, recv[i], r, round, &z, &fp, &x);
+				dict_insert_concurrent(&s->dict, z, fp, x);
+			}
 		}
 		s->t_insert += MPI_Wtime() - t1;
 	}
@@ -185,26 +219,33 @@ static void probe_shard(search_t *s, int pass)
 		double t1 = MPI_Wtime();
 		s->t_comm += t1 - t0;
 
-		const uint64_t *recv = s->ex.recv;
+		(void)m;
 		uint64_t cand = 0;
+		for (int r = 0; r < s->p; r++) {
+			const uint64_t *recv = s->ex.recv + s->ex.recv_displ[r];
+			int count = s->ex.recv_count[r];
 #pragma omp parallel for schedule(static) reduction(+:cand)
-		for (size_t i = 0; i < m; i += 2) {
-			if (i + 2 * PREFETCH_AHEAD < m)
-				dict_prefetch(&s->dict, recv[i + 2 * PREFETCH_AHEAD] & mask);
-			uint64_t w = recv[i], y = recv[i + 1];
-			uint64_t x[MAX_CANDIDATES];
-			int nx = dict_probe(&s->dict, w & mask, w >> n, MAX_CANDIDATES, x);
-			if (nx < 0)
-				errx(1, "too many candidates for one key");
-			cand += (uint64_t)nx;
-			for (int j = 0; j < nx; j++) {
-				if (!is_good_pair(x[j], y))
-					continue;
+			for (int i = 0; i < count; i++) {
+				uint64_t z, fp, y;
+				if (i + PREFETCH_AHEAD < count) {
+					unpack(s, recv[i + PREFETCH_AHEAD], r, round, &z, &fp, &y);
+					dict_prefetch(&s->dict, z);
+				}
+				unpack(s, recv[i], r, round, &z, &fp, &y);
+				uint64_t x[MAX_CANDIDATES];
+				int nx = dict_probe(&s->dict, z, fp, MAX_CANDIDATES, x);
+				if (nx < 0)
+					errx(1, "too many candidates for one key");
+				cand += (uint64_t)nx;
+				for (int j = 0; j < nx; j++) {
+					if (!is_good_pair(x[j], y))
+						continue;
 #pragma omp critical(results)
-				if (s->nres < MAX_RESULTS) {
-					s->res1[s->nres] = x[j];
-					s->res2[s->nres] = y;
-					s->nres++;
+					if (s->nres < MAX_RESULTS) {
+						s->res1[s->nres] = x[j];
+						s->res2[s->nres] = y;
+						s->nres++;
+					}
 				}
 			}
 		}
@@ -293,9 +334,18 @@ int main(int argc, char **argv)
 	s.block = 1ull << log_block;
 	if (s.block > per_rank)
 		s.block = per_rank;
-	s.start = (s.rank * N) / s.p;
-	s.end = ((s.rank + 1) * N) / s.p;
+	s.start = slice_start(s.rank, s.p);
+	s.end = slice_start(s.rank + 1, s.p);
 	s.rounds = (per_rank + s.block - 1) / s.block;
+
+	/* layout of a packed word */
+	s.qbits = 64 - __builtin_clzll(((N - 1) / s.p) | 1);
+	s.obits = s.block > 1 ? 64 - __builtin_clzll(s.block - 1) : 1;
+	s.fpbits = 64 - s.qbits - s.obits;
+	if (s.fpbits > 63 - n)
+		s.fpbits = 63 - n;
+	if (s.fpbits < 8)
+		errx(1, "only %d fingerprint bits fit in a word: use more ranks or smaller blocks", s.fpbits);
 
 	/* expected entries per rank and per pass, at the target load factor */
 	uint64_t expected = N / ((uint64_t)s.p * s.passes);
@@ -304,7 +354,7 @@ int main(int argc, char **argv)
 		errx(1, "rank %d: cannot allocate the dictionary", s.rank);
 
 	s.w = malloc(s.block * sizeof(uint64_t));
-	s.send = malloc(2 * s.block * sizeof(uint64_t));
+	s.send = malloc(s.block * sizeof(uint64_t));
 	exchange_init(&s.ex, s.p);
 
 	if (s.rank == 0) {
@@ -313,6 +363,7 @@ int main(int argc, char **argv)
 		printf("n = %d, %d ranks x %d threads, %d pass(es), blocks of %" PRIu64 " keys\n",
 		       n, s.p, omp_get_max_threads(), s.passes, s.block);
 		printf("dictionary per rank: %s\n", mem);
+		printf("packed pair: %d bits of z / p, %d of offset, %d of fingerprint\n", s.qbits, s.obits, s.fpbits);
 	}
 
 	MPI_Barrier(MPI_COMM_WORLD);
@@ -331,8 +382,9 @@ int main(int argc, char **argv)
 	double t_local[5] = {s.t_eval, s.t_comm, s.t_insert, s.t_probe, elapsed};
 	double t_max[5];
 	MPI_Reduce(t_local, t_max, 5, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-	uint64_t cand = 0;
+	uint64_t cand = 0, words = 0;
 	MPI_Reduce(&s.candidates, &cand, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+	MPI_Reduce(&s.words_sent, &words, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
 
 	/* results: gather on rank 0 */
 	int *counts = s.rank == 0 ? malloc(s.p * sizeof(int)) : NULL;
@@ -352,6 +404,9 @@ int main(int argc, char **argv)
 	if (s.rank == 0) {
 		printf("time: %.2f s (evaluation %.2f, exchange %.2f, insertion %.2f, probing %.2f; max over ranks)\n",
 		       t_max[4], t_max[0], t_max[1], t_max[2], t_max[3]);
+		char vol[32];
+		human_bytes((double)words * sizeof(uint64_t), vol);
+		printf("data exchanged: %s\n", vol);
 		printf("candidates checked: %" PRIu64 "\n", cand);
 		for (int i = 0; i < total; i++)
 			printf("solution: %" PRIx64 " %" PRIx64 "\n", k1[i], k2[i]);
